@@ -1,61 +1,92 @@
-# Security Policy
+# Molt VM Security Hardening
 
-If you believe you've found a security issue in Moltbot, please report it privately.
+This document describes the security measures implemented in the Molt base image.
 
-## Reporting
+## SSH Hardening
 
-- Email: `steipete@gmail.com`
-- What to include: reproduction steps, impact assessment, and (if possible) a minimal PoC.
+### Authentication
+- **Key-only authentication**: Password authentication is disabled
+- **No root password login**: Root can only use SSH keys
+- **Public key required**: `PubkeyAuthentication yes`
+- **No empty passwords**: `PermitEmptyPasswords no`
 
-## Operational Guidance
+### Connection Limits
+- **Max auth tries**: 3 attempts before disconnect
+- **Login grace time**: 60 seconds to authenticate
+- **Client keepalive**: 300 seconds interval, 2 max failures
+- **No X11 forwarding**: Disabled for reduced attack surface
 
-For threat model + hardening guidance (including `moltbot security audit --deep` and `--fix`), see:
-
-- `https://docs.molt.bot/gateway/security`
-
-### Web Interface Safety
-
-Moltbot's web interface is intended for local use only. Do **not** bind it to the public internet; it is not hardened for public exposure.
-
-## Runtime Requirements
-
-### Node.js Version
-
-Moltbot requires **Node.js 22.12.0 or later** (LTS). This version includes important security patches:
-
-- CVE-2025-59466: async_hooks DoS vulnerability
-- CVE-2026-21636: Permission model bypass vulnerability
-
-Verify your Node.js version:
-
-```bash
-node --version  # Should be v22.12.0 or later
+### SSH Config (`/etc/ssh/sshd_config`)
+```
+PasswordAuthentication no
+PermitRootLogin prohibit-password
+PubkeyAuthentication yes
+PermitEmptyPasswords no
+ChallengeResponseAuthentication no
+MaxAuthTries 3
+LoginGraceTime 60
+ClientAliveInterval 300
+ClientAliveCountMax 2
+X11Forwarding no
 ```
 
-### Docker Security
+## fail2ban - Brute Force Protection
 
-When running Moltbot in Docker:
+fail2ban monitors `/var/log/auth.log` and automatically bans IPs that fail authentication.
 
-1. The official image runs as a non-root user (`node`) for reduced attack surface
-2. Use `--read-only` flag when possible for additional filesystem protection
-3. Limit container capabilities with `--cap-drop=ALL`
-
-Example secure Docker run:
-
-```bash
-docker run --read-only --cap-drop=ALL \
-  -v moltbot-data:/app/data \
-  moltbot/moltbot:latest
+### Configuration (`/etc/fail2ban/jail.d/sshd.local`)
+```
+[sshd]
+enabled = true
+port = ssh
+filter = sshd
+logpath = /var/log/auth.log
+maxretry = 5      # 5 failed attempts
+bantime = 3600    # 1 hour ban
+findtime = 600    # within 10 minute window
 ```
 
-## Security Scanning
-
-This project uses `detect-secrets` for automated secret detection in CI/CD.
-See `.detect-secrets.cfg` for configuration and `.secrets.baseline` for the baseline.
-
-Run locally:
-
+### Monitoring
 ```bash
-pip install detect-secrets==1.5.0
-detect-secrets scan --baseline .secrets.baseline
+# Check banned IPs
+sudo fail2ban-client status sshd
+
+# Unban an IP
+sudo fail2ban-client set sshd unbanip 1.2.3.4
 ```
+
+## Network Security
+
+Fly.io handles network-level firewall:
+- Only ports defined in `fly.toml` are exposed (22, 8080)
+- No direct internet access to other ports
+- Fly.io Wireguard mesh for private networking
+
+## Logging
+
+- **rsyslog**: Runs in container for auth logging
+- **Auth logs**: `/var/log/auth.log`
+- **fail2ban logs**: `/var/log/molt/fail2ban.log`
+- **SSH logs**: `/var/log/molt/sshd.log`
+
+## Known Attack Patterns
+
+Based on observed attacks (ref: @the_smart_ape):
+- Automated SSH brute-force (11K+ attempts/24h from single IP)
+- Chinese IP ranges targeting AI/dev servers
+- Attempts to exfiltrate API keys and credentials
+
+## Best Practices for Users
+
+1. **Never commit secrets** to git
+2. **Use environment variables** for API keys
+3. **Review authorized_keys** periodically
+4. **Check auth.log** for suspicious activity
+
+## Supervisor Services
+
+Security services managed by supervisor:
+- `rsyslog` (priority 10) - Auth logging
+- `fail2ban` (priority 50) - Brute force protection
+- `sshd` (priority 100) - SSH server
+- `webui` (priority 200) - Web interface (runs as molt user)
